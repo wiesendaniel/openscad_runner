@@ -1,14 +1,12 @@
 import os
-import sys
-import math
-import filecmp
 import os.path
 import platform
 import subprocess
 import distutils.spawn
+import re
 
 from enum import Enum
-from PIL import Image, ImageChops
+from PIL import Image
 import pygifsicle
 from apng import APNG
 
@@ -57,6 +55,38 @@ class ColorScheme(Enum):
     monotone       = "Monotone"
 
 
+class Feature(Enum):
+    """
+    Features Enum class.
+    - fast_csg
+    - fast_csg_safer
+    - fast_csg_debug
+    - manifold
+    - roof
+    - input_driver_dbus
+    - lazy_union
+    - vertex_object_renderers_indexing
+    - textmetrics
+    - import_function
+    - predictible_output
+    - render_colors
+    - python_engine
+    """
+    fast_csg = "fast-csg"
+    fast_csg_safer = "fast-csg-safer"
+    fast_csg_debug = "fast-csg-debug"
+    manifold = "manifold"
+    roof = "roof"
+    input_driver_dbus = "input-driver-dbus"
+    lazy_union = "lazy-union"
+    vertex_object_renderers_indexing = "vertex-object-renderers-indexing"
+    textmetrics = "textmetrics"
+    import_function = "import-function"
+    predictible_output = "predictible-output"
+    render_colors = "render-colors"
+    python_engine = "python-engine"
+
+
 class OpenScadRunner(object):
     def __init__(
         self, scriptfile, outfile,
@@ -82,7 +112,9 @@ class OpenScadRunner(object):
         customizer_params={},
         hard_warnings=False,
         quiet=False,
-        verbose=False
+        verbose=False,
+        nightly=False,
+        enable_features=[],
     ):
         """
         Initializer method.  Arguments are:
@@ -111,25 +143,48 @@ class OpenScadRunner(object):
         - hard_warnings = Stop at first WARNING, as if it were an ERROR.  Default: False
         - quiet = Suppresses non-error, non-warning messages.  Default: False
         - verbose = Print the command-line to stdout on each execution.  Default: False
+        - nightly = Use the nightly build of OpenSCAD.  Disables Version check and enables enable_features  Default: False
+        - enable_features = A list of Features to enable.  See Features Enum. Only applicable for nightly is set to True.  Default: []
         """
         if platform.system() == "Darwin":
             self.OPENSCAD = "/Applications/OpenSCAD.app/Contents/MacOS/OpenSCAD"
         elif platform.system() == "Windows":
-            if distutils.spawn.find_executable("openscad"):
+            test_paths = [
+                "C:\\Program Files\\openSCAD\\openscad.com",
+                "C:\\Program Files (x86)\\openSCAD\\openscad.com",
+            ] if not nightly else [
+                "C:\\Program Files\\openSCAD (Nightly)\\openscad.com",
+                "C:\\Program Files (x86)\\openSCAD (Nightly)\\openscad.com",
+            ]
+            for p in test_paths:
+                if os.path.isfile(p):
+                    self.OPENSCAD = p
+                    break
+            
+            if not hasattr(self, "OPENSCAD") and distutils.spawn.find_executable("openscad"):
                 self.OPENSCAD = "openscad"
-            else:
-                test_paths = [
-                    "C:\\Program Files\\openSCAD\\openscad.com",
-                    "C:\\Program Files (x86)\\openSCAD\\openscad.com",
-                ]
-                for p in test_paths:
-                    if os.path.isfile(p):
-                        self.OPENSCAD = p
-                        break
             if not hasattr(self, "OPENSCAD"):
                 raise Exception("Can't find OpenSCAD executable. Is OpenSCAD on your system PATH?")
         else:
             self.OPENSCAD = "openscad"
+        
+        # Check openscad version
+        p = subprocess.Popen([self.OPENSCAD, "-v"], shell=False, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
+        (stdoutdata, stderrdata) = p.communicate(None)
+        stderrdata = stderrdata.decode('utf-8')
+        if p.returncode != 0:
+            raise Exception("Probing OpenSCAD version failed. Error: {}".format(stderrdata.decode('utf-8')))
+        
+        if not nightly:
+            stdoutdata = stdoutdata.decode('utf-8') or stderrdata  # OpenSCAD writes version info to stderr
+            version = re.search(r'\b(\d+)\.(\d+)\.(\d+)\b', stdoutdata)
+            version_major = int(version.group(1))
+            version_minor = int(version.group(2))
+            version_patch = int(version.group(3))
+
+            if version_major != 2021 or version_minor != 1:
+                Exception("ERROR: Running with OpenSCAD version {}.{}.{}. This may result in unexpected behavior. This version of openscad_runner is implemented against 2021.01 (stable).".format(version_major, version_minor, version_patch))
+                
         self.scriptfile = scriptfile
         self.outfile = outfile
         self.imgsize = imgsize
@@ -155,6 +210,8 @@ class OpenScadRunner(object):
         self.hard_warnings = hard_warnings
         self.quiet = quiet
         self.verbose = verbose
+        self.nightly = nightly
+        self.enable_features = enable_features
 
         self.cmdline = []
         self.script = []
@@ -223,15 +280,18 @@ class OpenScadRunner(object):
             if self.animate is not None:
                 scadcmd.extend(["--animate", "{}".format(self.animate)])
             if self.render_mode == RenderMode.render:
-                scadcmd.extend(["--render", ""])
+                scadcmd.extend(["--render", "" if not self.nightly else "geometry"]) # as of nightly 2024.08.30 a value seems to be required but it is not documented and the default value is not clear and it does not seem to be used
             elif self.render_mode == RenderMode.preview:
-                scadcmd.extend(["--preview", ""])
+                scadcmd.extend(["--preview", "" if not self.nightly else "opencsg"]) # as of nightly 2024.08.30 a value seems to be required but it is not documented and the default value is not clear and it does not seem to be used
             elif self.render_mode == RenderMode.thrown_together:
                 scadcmd.extend(["--preview", "throwntogether"])
             elif self.render_mode == RenderMode.wireframe:
-                scadcmd.extend(["--render", ""])
+                scadcmd.extend(["--render", "" if not self.nightly else "geometry"]) # as of nightly 2024.08.30 a value seems to be required but it is not documented and the default value is not clear and it does not seem to be used
             if self.csg_limit is not None:
                 scadcmd.extend(["--csglimit", self.csg_limit])
+            if self.nightly:
+                for feature in self.enable_features:
+                    scadcmd.extend(["--enable", feature.value])
         if self.deps_file != None:
             scadcmd.extend(["-d", self.deps_file])
         if self.make_file != None:
@@ -272,7 +332,7 @@ class OpenScadRunner(object):
         if self.render_mode==RenderMode.test_only and os.path.isfile("foo.term"):
             os.unlink("foo.term")
         with open(self.scriptfile, "r") as f:
-            self.script = f.readlines();
+            self.script = f.readlines()
         if self.success and self.render_mode != RenderMode.test_only:
             if self.animate:
                 imgfiles = ["{}{:05d}.png".format(basename,i) for i in range(self.animate)]
